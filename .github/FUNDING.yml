@@ -1,4 +1,4 @@
-# GitHub Funding Configuration
-# Displays a "Sponsor" button on the repository page
+# Supported funding model platforms
 
-github: [LeanBitLab]
+github: LeanBitLab
+open_collective: leanbitlab-org
