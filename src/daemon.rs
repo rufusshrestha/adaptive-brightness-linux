@@ -3,10 +3,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ambient::{AmbientSensor, AmbientTracker};
 use crate::backlight::InternalPanel;
-use crate::config::{get_config_path, load_config, save_config, DeviceId};
+use crate::config::{get_config_path, load_config, DeviceId};
 use crate::ddc::{start_ddc_worker, DdcCommand};
-use crate::profile::{find_nearest_point, interpolate_linear};
-use crate::state::{get_state_dir, read_pause_state, write_device_state};
+use crate::profile::interpolate_linear;
+use crate::state::{
+    clear_manual_override, get_state_dir, read_pause_state, set_pause_state, write_device_state,
+    PauseState,
+};
 
 /// Internal smooth fading state machine.
 pub struct SmoothFader {
@@ -50,11 +53,13 @@ impl SmoothFader {
 }
 
 /// Learning tracker for internal panel manual adjustments.
+#[allow(dead_code)]
 pub struct LearningTracker {
     pub last_manual_pct: u8,
     pub manual_detected_time: Option<Instant>,
 }
 
+#[allow(dead_code)]
 impl LearningTracker {
     pub fn new() -> Self {
         Self {
@@ -62,6 +67,25 @@ impl LearningTracker {
             manual_detected_time: None,
         }
     }
+}
+
+/// Determines if hardware brightness was overridden manually based on the difference
+/// between the current hardware raw/pct and what lbright last applied.
+pub fn is_manual_override_detected(
+    hw_raw: i64,
+    hw_pct: u8,
+    last_applied_raw: i64,
+    max_raw: i64,
+) -> bool {
+    if max_raw <= 0 {
+        return false;
+    }
+    let last_applied_pct = ((last_applied_raw * 100 + max_raw / 2) / max_raw).clamp(0, 100) as u8;
+    let pct_diff = (hw_pct as i32 - last_applied_pct as i32).abs();
+    let raw_diff = (hw_raw - last_applied_raw).abs();
+    let threshold_raw = (max_raw / 50).max(2);
+
+    pct_diff >= 2 || raw_diff >= threshold_raw
 }
 
 pub fn get_current_minute_of_day() -> u16 {
@@ -113,6 +137,11 @@ pub fn run_daemon(foreground: bool) {
     let state_dir = get_state_dir();
     let _ = fs::create_dir_all(&state_dir);
 
+    // On start or restart, clear any manual override from previous daemon session
+    if clear_manual_override(&state_dir) {
+        eprintln!("[lbright] Daemon started/restarted: cleared manual override, resuming auto brightness.");
+    }
+
     let (mut config, warnings) = load_config(&config_path);
     for w in warnings {
         eprintln!("[lbright] Config warning: {}", w);
@@ -134,49 +163,105 @@ pub fn run_daemon(foreground: bool) {
         SmoothFader::new(cur, p.max_raw)
     });
 
-    let mut learning = LearningTracker::new();
+    let mut last_applied_raw = panel.as_ref().and_then(|p| p.get_raw().ok()).unwrap_or(0);
+    let mut was_paused = read_pause_state(&state_dir).is_paused();
 
     let mut last_profile_calc = Instant::now() - Duration::from_secs(3600); // Trigger immediately
     let mut last_ambient_check = Instant::now();
     let mut last_config_check = Instant::now();
     let mut last_ddc_rescan = Instant::now();
     let mut last_tick_instant = Instant::now();
-
-    let mut current_internal_target_pct: u8 = 50;
+    let mut last_tick_system_time = SystemTime::now();
 
     loop {
         thread_sleep_tick(Duration::from_millis(100));
 
-        // Detect system sleep/resume via monotonic clock gap (> 5s jump)
-        let elapsed_since_last_tick = last_tick_instant.elapsed();
-        if elapsed_since_last_tick > Duration::from_secs(5) {
+        // Detect system sleep/resume via monotonic clock gap or system time gap (> 5s jump)
+        let mono_elapsed = last_tick_instant.elapsed();
+        let sys_elapsed = SystemTime::now()
+            .duration_since(last_tick_system_time)
+            .unwrap_or_default();
+
+        if mono_elapsed > Duration::from_secs(5) || sys_elapsed > Duration::from_secs(5) {
+            let gap_sec = mono_elapsed.as_secs_f32().max(sys_elapsed.as_secs_f32());
             eprintln!(
                 "[lbright] System resume detected (gap of {:.1}s). Triggering profile recalculation and DDC rescan...",
-                elapsed_since_last_tick.as_secs_f32()
+                gap_sec
             );
+            if clear_manual_override(&state_dir) {
+                eprintln!("[lbright] Resumed from standby: cleared manual override, resuming auto brightness.");
+            }
             last_profile_calc = Instant::now() - Duration::from_secs(3600);
             let _ = ddc_worker.tx.send(DdcCommand::Rescan);
         }
         last_tick_instant = Instant::now();
+        last_tick_system_time = SystemTime::now();
 
-        // 1. Advance internal smooth fade state machine
-        if let (Some(f), Some(p)) = (fader.as_mut(), panel.as_ref()) {
-            if config.general.fade_internal {
-                let (raw, changed) = f.tick();
-                if changed {
-                    let _ = p.set_raw(raw);
+        // 1. Check pause state
+        let mut pause_state = read_pause_state(&state_dir);
+        let mut is_paused = pause_state.is_paused();
+
+        // If transitioning from paused to active, trigger immediate profile recalculation
+        if was_paused && !is_paused {
+            eprintln!("[lbright] Auto brightness resumed. Recalculating profile target...");
+            last_profile_calc = Instant::now() - Duration::from_secs(3600);
+        }
+        was_paused = is_paused;
+
+        // 2. Hardware brightness check & manual override detection for internal panel
+        if let Some(p) = &panel {
+            if let (Ok(hw_raw), Ok(hw_pct)) = (p.get_raw(), p.get_percent()) {
+                if !is_paused {
+                    // Check if hardware brightness was overridden manually externally
+                    if is_manual_override_detected(hw_raw, hw_pct, last_applied_raw, p.max_raw) {
+                        let last_applied_pct = if p.max_raw > 0 {
+                            ((last_applied_raw * 100 + p.max_raw / 2) / p.max_raw).clamp(0, 100) as u8
+                        } else {
+                            0
+                        };
+                        eprintln!(
+                            "[lbright] Manual brightness adjustment detected: hardware is at {}% (was {}%). Stopping auto brightness until standby or restart.",
+                            hw_pct, last_applied_pct
+                        );
+                        let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                        pause_state = PauseState::PausedManualOverride;
+                        is_paused = true;
+                        was_paused = true;
+                        last_applied_raw = hw_raw;
+                        if let Some(f) = fader.as_mut() {
+                            f.current_raw = hw_raw;
+                            f.target_raw = hw_raw;
+                        }
+                    }
+                } else {
+                    // While paused / stopped, keep fader and last_applied_raw in sync with hardware
+                    last_applied_raw = hw_raw;
+                    if let Some(f) = fader.as_mut() {
+                        f.current_raw = hw_raw;
+                        f.target_raw = hw_raw;
+                    }
                 }
-            } else if f.current_raw != f.target_raw {
-                f.current_raw = f.target_raw;
-                let _ = p.set_raw(f.target_raw);
             }
         }
 
-        // 2. Check pause state
-        let pause_state = read_pause_state(&state_dir);
-        let is_paused = pause_state.is_paused();
+        // 3. Advance internal smooth fade state machine (only when active!)
+        if !is_paused {
+            if let (Some(f), Some(p)) = (fader.as_mut(), panel.as_ref()) {
+                if config.general.fade_internal {
+                    let (raw, changed) = f.tick();
+                    if changed {
+                        let _ = p.set_raw(raw);
+                        last_applied_raw = p.get_raw().unwrap_or(raw);
+                    }
+                } else if f.current_raw != f.target_raw {
+                    f.current_raw = f.target_raw;
+                    let _ = p.set_raw(f.target_raw);
+                    last_applied_raw = p.get_raw().unwrap_or(f.target_raw);
+                }
+            }
+        }
 
-        // 3. Config mtime check (every 1 second)
+        // 4. Config mtime check (every 1 second)
         if last_config_check.elapsed() >= Duration::from_secs(1) {
             last_config_check = Instant::now();
             let cur_mtime = fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
@@ -194,7 +279,7 @@ pub fn run_daemon(foreground: bool) {
             }
         }
 
-        // 4. Ambient light sensor check (every ambient_poll_sec)
+        // 5. Ambient light sensor check (every ambient_poll_sec)
         if config.general.ambient && !is_paused && last_ambient_check.elapsed() >= Duration::from_secs(config.general.ambient_poll_sec as u64) {
             last_ambient_check = Instant::now();
             if let Some(sensor) = &als_sensor {
@@ -208,7 +293,7 @@ pub fn run_daemon(foreground: bool) {
             }
         }
 
-        // 5. Profile evaluation (every interval_min)
+        // 6. Profile evaluation (every interval_min)
         let interval_duration = Duration::from_secs((config.general.interval_min as u64 * 60).max(1));
         if !is_paused && last_profile_calc.elapsed() >= interval_duration {
             last_profile_calc = Instant::now();
@@ -232,8 +317,6 @@ pub fn run_daemon(foreground: bool) {
                     let final_target = ((base_target as i32 + ambient_offset as i32)
                         .clamp(config.general.min_internal as i32, config.general.max_internal as i32))
                         as u8;
-
-                    current_internal_target_pct = final_target;
 
                     if let Some(f) = fader.as_mut() {
                         f.set_target_pct(final_target);
@@ -266,52 +349,119 @@ pub fn run_daemon(foreground: bool) {
             }
         }
 
-        // 6. Periodic DDC display rescan (every ddc_rescan_min minutes)
+        // 7. Periodic DDC display rescan (every ddc_rescan_min minutes)
         if last_ddc_rescan.elapsed() >= Duration::from_secs(config.general.ddc_rescan_min as u64 * 60) {
             last_ddc_rescan = Instant::now();
             let _ = ddc_worker.tx.send(DdcCommand::Rescan);
-        }
-
-        // 7. Internal panel manual learning heuristic
-        if config.general.learn_internal && !is_paused {
-            if let Some(p) = &panel {
-                if let Ok(cur_pct) = p.get_percent() {
-                    let diff = (cur_pct as i32 - current_internal_target_pct as i32).abs();
-                    if diff >= 5 {
-                        if learning.last_manual_pct == cur_pct {
-                            if let Some(t0) = learning.manual_detected_time {
-                                // Persisted for at least 10 seconds
-                                if t0.elapsed() >= Duration::from_secs(10) {
-                                    let cur_minutes = get_current_minute_of_day();
-                                    if let Some(internal_dev) = config.get_device_mut(&DeviceId::Internal(None)) {
-                                        if let Some(nearest) = find_nearest_point(&internal_dev.points, cur_minutes) {
-                                            eprintln!(
-                                                "[lbright] Learned new manual preference: {}% for point {:02}{:02}",
-                                                cur_pct,
-                                                nearest / 60,
-                                                nearest % 60
-                                            );
-                                            internal_dev.points.insert(nearest, cur_pct);
-                                            current_internal_target_pct = cur_pct;
-                                            let _ = save_config(&config_path, &config);
-                                        }
-                                    }
-                                    learning.manual_detected_time = None;
-                                }
-                            }
-                        } else {
-                            learning.last_manual_pct = cur_pct;
-                            learning.manual_detected_time = Some(Instant::now());
-                        }
-                    } else {
-                        learning.manual_detected_time = None;
-                    }
-                }
-            }
         }
     }
 }
 
 fn thread_sleep_tick(d: Duration) {
     std::thread::sleep(d);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manual_override_detection() {
+        let max_raw = 96000;
+        let last_applied_raw = 48000; // 50%
+        let last_applied_pct = 50;
+
+        // Exact match -> no override
+        assert!(!is_manual_override_detected(
+            last_applied_raw,
+            last_applied_pct,
+            last_applied_raw,
+            max_raw
+        ));
+
+        // Minor 1-raw-unit driver quantization -> no false positive
+        assert!(!is_manual_override_detected(
+            last_applied_raw + 1,
+            last_applied_pct,
+            last_applied_raw,
+            max_raw
+        ));
+        assert!(!is_manual_override_detected(
+            last_applied_raw - 1,
+            last_applied_pct,
+            last_applied_raw,
+            max_raw
+        ));
+
+        // Small panel (e.g. 255 max raw) 1 unit off -> no false positive
+        assert!(!is_manual_override_detected(128, 50, 127, 255));
+
+        // User manual adjustment +5% on 96000 panel -> detected!
+        let new_raw = 52800; // 55%
+        assert!(is_manual_override_detected(
+            new_raw,
+            55,
+            last_applied_raw,
+            max_raw
+        ));
+
+        // User manual adjustment down to 20% -> detected!
+        let low_raw = 19200; // 20%
+        assert!(is_manual_override_detected(
+            low_raw,
+            20,
+            last_applied_raw,
+            max_raw
+        ));
+
+        // User manual adjustment on 255 panel -> detected!
+        assert!(is_manual_override_detected(204, 80, 128, 255));
+    }
+
+    #[test]
+    fn test_manual_override_cleared_on_restart() {
+        let tmp = std::env::temp_dir().join("lbright_test_daemon_restart");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Simulate manual override active
+        set_pause_state(&tmp, &PauseState::PausedManualOverride).unwrap();
+        assert_eq!(read_pause_state(&tmp), PauseState::PausedManualOverride);
+
+        // When daemon starts/restarts, manual override is cleared
+        assert!(clear_manual_override(&tmp));
+        assert_eq!(read_pause_state(&tmp), PauseState::Active);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_manual_override_cleared_on_standby_resume() {
+        let tmp = std::env::temp_dir().join("lbright_test_daemon_resume");
+        let _ = fs::remove_dir_all(&tmp);
+
+        set_pause_state(&tmp, &PauseState::PausedManualOverride).unwrap();
+        assert!(read_pause_state(&tmp).is_paused());
+
+        // System resume triggers clear_manual_override
+        assert!(clear_manual_override(&tmp));
+        assert_eq!(read_pause_state(&tmp), PauseState::Active);
+        assert!(!read_pause_state(&tmp).is_paused());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_indefinite_pause_preserved_on_resume_and_restart() {
+        let tmp = std::env::temp_dir().join("lbright_test_daemon_indefinite");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // User explicitly set indefinite pause
+        set_pause_state(&tmp, &PauseState::PausedIndefinite).unwrap();
+
+        // Neither restart nor standby resume should clear an explicit indefinite pause
+        assert!(!clear_manual_override(&tmp));
+        assert_eq!(read_pause_state(&tmp), PauseState::PausedIndefinite);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

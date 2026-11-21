@@ -132,6 +132,7 @@ fn main() {
                 }
             };
 
+            let state_dir = get_state_dir();
             if let Ok(dev_id) = dev_str.parse::<DeviceId>() {
                 match dev_id {
                     DeviceId::Internal(specific) => {
@@ -144,7 +145,11 @@ fn main() {
                                 eprintln!("Failed to set internal backlight: {}", e);
                                 exit(1);
                             } else {
-                                println!("Set internal backlight [{}] to {}%", p.name, pct);
+                                let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                                println!(
+                                    "Set internal backlight [{}] to {}% (auto brightness stopped until standby or restart)",
+                                    p.name, pct
+                                );
                             }
                         } else {
                             eprintln!("Error: No matching internal backlight panel found.");
@@ -169,7 +174,11 @@ fn main() {
 
                         if let Some(idx) = target_idx {
                             if ddc_set_vcp(idx, pct, std::time::Duration::from_secs(5)) {
-                                println!("Set DDC display {} to {}%", idx, pct);
+                                let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                                println!(
+                                    "Set DDC display {} to {}% (auto brightness stopped until standby or restart)",
+                                    idx, pct
+                                );
                             } else {
                                 eprintln!("Failed to set DDC brightness on display {}.", idx);
                                 exit(1);
@@ -192,6 +201,9 @@ fn main() {
                 match p {
                     PauseState::Active => println!("Adaptive adjustments: ACTIVE"),
                     PauseState::PausedIndefinite => println!("Adaptive adjustments: PAUSED (Indefinitely)"),
+                    PauseState::PausedManualOverride => println!(
+                        "Adaptive adjustments: PAUSED (Manual override - resumes on standby or restart)"
+                    ),
                     PauseState::PausedUntil(_) => {
                         if let Some(sec) = p.remaining_seconds() {
                             println!("Adaptive adjustments: PAUSED ({}m {}s remaining)", sec / 60, sec % 60);
@@ -213,6 +225,7 @@ fn main() {
                         match new_state {
                             PauseState::Active => println!("Adaptive brightness adjustments RESUMED."),
                             PauseState::PausedIndefinite => println!("Adaptive brightness adjustments PAUSED INDEFINITELY."),
+                            PauseState::PausedManualOverride => println!("Adaptive brightness adjustments PAUSED (Manual override)."),
                             PauseState::PausedUntil(ts) => {
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)

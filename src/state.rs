@@ -17,13 +17,14 @@ pub enum PauseState {
     Active,
     PausedUntil(u64), // Unix epoch in seconds
     PausedIndefinite,
+    PausedManualOverride, // Stopped due to manual brightness override
 }
 
 impl PauseState {
     pub fn is_paused(&self) -> bool {
         match self {
             PauseState::Active => false,
-            PauseState::PausedIndefinite => true,
+            PauseState::PausedIndefinite | PauseState::PausedManualOverride => true,
             PauseState::PausedUntil(ts) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -36,8 +37,9 @@ impl PauseState {
 
     pub fn remaining_seconds(&self) -> Option<u64> {
         match self {
-            PauseState::Active => None,
-            PauseState::PausedIndefinite => None,
+            PauseState::Active
+            | PauseState::PausedIndefinite
+            | PauseState::PausedManualOverride => None,
             PauseState::PausedUntil(ts) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -64,6 +66,8 @@ pub fn read_pause_state(state_dir: &Path) -> PauseState {
             let s = content.trim();
             if s.eq_ignore_ascii_case("indefinite") {
                 PauseState::PausedIndefinite
+            } else if s.eq_ignore_ascii_case("override") || s.eq_ignore_ascii_case("manual") {
+                PauseState::PausedManualOverride
             } else if let Ok(ts) = s.parse::<u64>() {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -96,7 +100,18 @@ pub fn set_pause_state(state_dir: &Path, state: &PauseState) -> io::Result<()> {
             Ok(())
         }
         PauseState::PausedIndefinite => fs::write(&pause_file, "indefinite"),
+        PauseState::PausedManualOverride => fs::write(&pause_file, "override"),
         PauseState::PausedUntil(ts) => fs::write(&pause_file, ts.to_string()),
+    }
+}
+
+/// Clears manual override if one is currently active, returning true if cleared.
+pub fn clear_manual_override(state_dir: &Path) -> bool {
+    if read_pause_state(state_dir) == PauseState::PausedManualOverride {
+        let _ = set_pause_state(state_dir, &PauseState::Active);
+        true
+    } else {
+        false
     }
 }
 
@@ -211,5 +226,25 @@ mod tests {
 
         set_pause_state(&tmp, &PauseState::Active).unwrap();
         assert_eq!(read_pause_state(&tmp), PauseState::Active);
+
+        // Test manual override state
+        set_pause_state(&tmp, &PauseState::PausedManualOverride).unwrap();
+        let state = read_pause_state(&tmp);
+        assert_eq!(state, PauseState::PausedManualOverride);
+        assert!(state.is_paused());
+        assert_eq!(state.remaining_seconds(), None);
+
+        // Test clearing manual override
+        assert!(clear_manual_override(&tmp));
+        assert_eq!(read_pause_state(&tmp), PauseState::Active);
+
+        // Clearing when already Active returns false
+        assert!(!clear_manual_override(&tmp));
+
+        // Clearing when PausedIndefinite leaves it untouched and returns false
+        set_pause_state(&tmp, &PauseState::PausedIndefinite).unwrap();
+        assert!(!clear_manual_override(&tmp));
+        assert_eq!(read_pause_state(&tmp), PauseState::PausedIndefinite);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

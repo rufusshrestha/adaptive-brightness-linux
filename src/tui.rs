@@ -38,6 +38,7 @@ pub fn run_tui() {
         let pause_str = match &pause {
             PauseState::Active => "Active".to_string(),
             PauseState::PausedIndefinite => "Paused (Indefinite)".to_string(),
+            PauseState::PausedManualOverride => "Paused (Manual override)".to_string(),
             PauseState::PausedUntil(_) => {
                 if let Some(sec) = pause.remaining_seconds() {
                     format!("Paused ({}m remaining)", sec / 60)
@@ -87,7 +88,13 @@ pub fn show_status(config: &Config, state_dir: &Path) {
     println!("State dir:   {}", state_dir.display());
 
     let pause = read_pause_state(state_dir);
-    println!("Adaptive Mode: {}", if pause.is_paused() { "PAUSED" } else { "RUNNING" });
+    let mode_str = match &pause {
+        PauseState::Active => "RUNNING",
+        PauseState::PausedIndefinite => "PAUSED (Indefinitely)",
+        PauseState::PausedManualOverride => "PAUSED (Manual override)",
+        PauseState::PausedUntil(_) => "PAUSED (Timed)",
+    };
+    println!("Adaptive Mode: {}", mode_str);
     if let Some(rem) = pause.remaining_seconds() {
         println!("Pause time remaining: {}m {}s", rem / 60, rem % 60);
     }

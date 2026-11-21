@@ -88,6 +88,7 @@ pub fn interpolate_linear(
 }
 
 /// Finds the nearest configured time point (in minutes) to the current time, wrapping midnight.
+#[allow(dead_code)]
 pub fn find_nearest_point(points: &BTreeMap<u16, u8>, now_minutes: u16) -> Option<u16> {
     if points.is_empty() {
         return None;
