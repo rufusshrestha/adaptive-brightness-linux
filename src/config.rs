@@ -117,12 +117,25 @@ impl DeviceConfig {
     }
 
     pub fn with_default_curve(id: DeviceId) -> Self {
-        let mut dev = Self::new(id, true);
-        dev.points.insert(0, 18); // 00:00 -> 18%
-        dev.points.insert(420, 45); // 07:00 -> 45%
-        dev.points.insert(720, 65); // 12:00 -> 65%
-        dev.points.insert(1140, 55); // 19:00 -> 55%
-        dev.points.insert(1380, 25); // 23:00 -> 25%
+        let mut dev = Self::new(id.clone(), true);
+        match id {
+            DeviceId::Internal(_) => {
+                dev.points.insert(0, 30); // 00:00 -> 30%
+                dev.points.insert(420, 40); // 07:00 -> 40%
+                dev.points.insert(540, 60); // 09:00 -> 60%
+                dev.points.insert(720, 75); // 12:00 -> 75%
+                dev.points.insert(1020, 40); // 17:00 -> 40%
+                dev.points.insert(1140, 30); // 19:00 -> 30%
+                dev.points.insert(1380, 30); // 23:00 -> 30%
+            }
+            DeviceId::Ddc(_) => {
+                dev.points.insert(0, 18); // 00:00 -> 18%
+                dev.points.insert(420, 45); // 07:00 -> 45%
+                dev.points.insert(720, 65); // 12:00 -> 65%
+                dev.points.insert(1140, 55); // 19:00 -> 55%
+                dev.points.insert(1380, 25); // 23:00 -> 25%
+            }
+        }
         dev
     }
 }
@@ -152,9 +165,9 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             interval_min: 15,
-            ambient: false,
-            ambient_poll_sec: 5,
-            ambient_average: 3,
+            ambient: true,
+            ambient_poll_sec: 2,
+            ambient_average: 2,
             ambient_hysteresis_pct: 3,
             fade_internal: true,
             fade_external: false,
@@ -559,10 +572,12 @@ pub fn save_config(path: &Path, config: &Config) -> io::Result<()> {
     save_atomic(path, &content)
 }
 
-/// Loads Config from path, returning default if not found.
+/// Loads Config from path, recreating and saving default config if missing or deleted.
 pub fn load_config(path: &Path) -> (Config, Vec<String>) {
     if !path.exists() {
-        return (Config::default(), Vec::new());
+        let default_config = Config::default();
+        let _ = save_config(path, &default_config);
+        return (default_config, Vec::new());
     }
     match fs::read_to_string(path) {
         Ok(content) => Config::from_ini_string(&content),
@@ -743,5 +758,31 @@ HDMI-A-1_0700=36
         assert_eq!(internal.points.get(&0), Some(&41));
         assert_eq!(internal.points.get(&420), Some(&28));
         assert_eq!(internal.points.get(&720), Some(&33));
+    }
+
+    #[test]
+    fn test_load_config_recreates_missing() {
+        let tmp_dir = std::env::temp_dir().join("lbright_test_recreate_cfg");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let config_path = tmp_dir.join("config.ini");
+
+        assert!(!config_path.exists());
+        let (config, warnings) = load_config(&config_path);
+        assert!(warnings.is_empty());
+        assert!(config_path.exists());
+        assert!(config.general.ambient);
+        assert_eq!(config.general.ambient_poll_sec, 2);
+        assert_eq!(config.general.ambient_average, 2);
+
+        let internal = config.get_internal().unwrap();
+        assert_eq!(internal.points.get(&0), Some(&30));
+        assert_eq!(internal.points.get(&420), Some(&40));
+        assert_eq!(internal.points.get(&540), Some(&60));
+        assert_eq!(internal.points.get(&720), Some(&75));
+        assert_eq!(internal.points.get(&1020), Some(&40));
+        assert_eq!(internal.points.get(&1140), Some(&30));
+        assert_eq!(internal.points.get(&1380), Some(&30));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

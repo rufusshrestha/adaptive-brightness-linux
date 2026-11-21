@@ -23,7 +23,7 @@ Built for microsecond-fast direct kernel `sysfs` I/O, robust external monitor DD
 
 - **⚡ Direct Sysfs Hardware Control:** Reads and writes directly to `/sys/class/backlight/*` with zero subprocess overhead and microsecond latency.
 - **🖥️ External Monitor Support (DDC/CI):** Communicates with external monitors via DDC/CI (VCP `0x10`) over an isolated worker thread with non-blocking timeouts to prevent system freezes.
-- **🛑 Automatic Pause on Manual Override:** Manually adjusting brightness (via laptop Fn keys, desktop sliders, `brightnessctl`, or `lbright set`) automatically stops auto brightness so it won't fight your preference. Automatically resumes when resuming from standby or restarting.
+- **🛑 Automatic Pause & Auto-Enable on Manual Override:** Manually adjusting brightness (via laptop Fn keys, desktop sliders, `brightnessctl`, or `lbright set`) to 5% or higher stops auto brightness so it won't fight your preference. It automatically resumes when resuming from standby, restarting, or when manual brightness is reduced to less than 5%.
 - **📈 24-Hour Time Curves:** Smooth, linear interpolation wrapping seamlessly across midnight.
 - **☀️ Ambient Light Sensor (ALS) Integration:** Smooths sensor readings with rolling averages and configurable hysteresis to eliminate screen brightness jitter.
 - **⌨️ Interactive Terminal UI (TUI):** Built-in ANSI menu (`lbright tui`) to view live status, add/edit/delete curve points, test time targets, toggle ALS, pause/resume, and rescan displays.

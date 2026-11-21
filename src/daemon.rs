@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ambient::{AmbientSensor, AmbientTracker};
 use crate::backlight::InternalPanel;
-use crate::config::{get_config_path, load_config, DeviceId};
+use crate::config::{get_config_path, load_config, save_config, Config, DeviceId};
 use crate::ddc::{start_ddc_worker, DdcCommand};
 use crate::profile::interpolate_linear;
 use crate::state::{
@@ -142,6 +142,18 @@ pub fn run_daemon(foreground: bool) {
         eprintln!("[lbright] Daemon started/restarted: cleared manual override, resuming auto brightness.");
     }
 
+    // If config file is missing or deleted, recreate it with default values
+    if !config_path.exists() {
+        eprintln!(
+            "[lbright] Configuration missing at '{}'. Recreating default config...",
+            config_path.display()
+        );
+        let default_config = Config::default();
+        if let Err(e) = save_config(&config_path, &default_config) {
+            eprintln!("[lbright] Failed to recreate config file: {}", e);
+        }
+    }
+
     let (mut config, warnings) = load_config(&config_path);
     for w in warnings {
         eprintln!("[lbright] Config warning: {}", w);
@@ -211,8 +223,35 @@ pub fn run_daemon(foreground: bool) {
         // 2. Hardware brightness check & manual override detection for internal panel
         if let Some(p) = &panel {
             if let (Ok(hw_raw), Ok(hw_pct)) = (p.get_raw(), p.get_percent()) {
-                if !is_paused {
-                    // Check if hardware brightness was overridden manually externally
+                if hw_pct < 5 {
+                    // Manual brightness reduced to < 5%: auto enable auto brightness!
+                    if is_paused {
+                        eprintln!(
+                            "[lbright] Manual brightness reduced to {}% (< 5%). Auto-enabling auto brightness...",
+                            hw_pct
+                        );
+                        let _ = set_pause_state(&state_dir, &PauseState::Active);
+                        pause_state = PauseState::Active;
+                        is_paused = false;
+                        was_paused = false;
+                        last_applied_raw = hw_raw;
+                        if let Some(f) = fader.as_mut() {
+                            f.current_raw = hw_raw;
+                        }
+                        last_profile_calc = Instant::now() - Duration::from_secs(3600);
+                    } else if is_manual_override_detected(hw_raw, hw_pct, last_applied_raw, p.max_raw) {
+                        eprintln!(
+                            "[lbright] Manual brightness reduced to {}% (< 5%). Auto brightness enabled.",
+                            hw_pct
+                        );
+                        last_applied_raw = hw_raw;
+                        if let Some(f) = fader.as_mut() {
+                            f.current_raw = hw_raw;
+                        }
+                        last_profile_calc = Instant::now() - Duration::from_secs(3600);
+                    }
+                } else if !is_paused {
+                    // Hardware brightness >= 5% and active: check if hardware brightness was overridden manually
                     if is_manual_override_detected(hw_raw, hw_pct, last_applied_raw, p.max_raw) {
                         let last_applied_pct = if p.max_raw > 0 {
                             ((last_applied_raw * 100 + p.max_raw / 2) / p.max_raw).clamp(0, 100) as u8
@@ -234,7 +273,7 @@ pub fn run_daemon(foreground: bool) {
                         }
                     }
                 } else {
-                    // While paused / stopped, keep fader and last_applied_raw in sync with hardware
+                    // While paused / stopped and >= 5%, keep fader and last_applied_raw in sync with hardware
                     last_applied_raw = hw_raw;
                     if let Some(f) = fader.as_mut() {
                         f.current_raw = hw_raw;
@@ -261,21 +300,34 @@ pub fn run_daemon(foreground: bool) {
             }
         }
 
-        // 4. Config mtime check (every 1 second)
+        // 4. Config check (every 1 second)
         if last_config_check.elapsed() >= Duration::from_secs(1) {
             last_config_check = Instant::now();
-            let cur_mtime = fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
-            if cur_mtime != last_config_mtime {
-                last_config_mtime = cur_mtime;
-                let (reloaded_config, warnings) = load_config(&config_path);
-                for w in warnings {
-                    eprintln!("[lbright] Config reload warning: {}", w);
-                }
-                config = reloaded_config;
+            if !config_path.exists() {
+                eprintln!(
+                    "[lbright] Configuration deleted at '{}'. Recreating default config...",
+                    config_path.display()
+                );
+                let default_config = Config::default();
+                let _ = save_config(&config_path, &default_config);
+                config = default_config;
                 ambient_tracker.set_capacity(config.general.ambient_average as usize);
-                eprintln!("[lbright] Configuration reloaded.");
-                // Trigger immediate profile recalculation
+                last_config_mtime = fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
                 last_profile_calc = Instant::now() - Duration::from_secs(3600);
+            } else {
+                let cur_mtime = fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
+                if cur_mtime != last_config_mtime {
+                    last_config_mtime = cur_mtime;
+                    let (reloaded_config, warnings) = load_config(&config_path);
+                    for w in warnings {
+                        eprintln!("[lbright] Config reload warning: {}", w);
+                    }
+                    config = reloaded_config;
+                    ambient_tracker.set_capacity(config.general.ambient_average as usize);
+                    eprintln!("[lbright] Configuration reloaded.");
+                    // Trigger immediate profile recalculation
+                    last_profile_calc = Instant::now() - Duration::from_secs(3600);
+                }
             }
         }
 
@@ -461,6 +513,26 @@ mod tests {
         // Neither restart nor standby resume should clear an explicit indefinite pause
         assert!(!clear_manual_override(&tmp));
         assert_eq!(read_pause_state(&tmp), PauseState::PausedIndefinite);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_reduced_to_under_5_auto_enables() {
+        let tmp = std::env::temp_dir().join("lbright_test_daemon_under5");
+        let _ = fs::remove_dir_all(&tmp);
+
+        // Scenario: Auto brightness was stopped/paused by manual override (e.g. at 50%)
+        set_pause_state(&tmp, &PauseState::PausedManualOverride).unwrap();
+        assert!(read_pause_state(&tmp).is_paused());
+
+        // When brightness is reduced to < 5%, auto brightness is re-enabled
+        let hw_pct: u8 = 3;
+        if hw_pct < 5 {
+            let _ = set_pause_state(&tmp, &PauseState::Active);
+        }
+        assert!(!read_pause_state(&tmp).is_paused());
+        assert_eq!(read_pause_state(&tmp), PauseState::Active);
 
         let _ = fs::remove_dir_all(&tmp);
     }

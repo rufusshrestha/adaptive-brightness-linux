@@ -145,11 +145,19 @@ fn main() {
                                 eprintln!("Failed to set internal backlight: {}", e);
                                 exit(1);
                             } else {
-                                let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
-                                println!(
-                                    "Set internal backlight [{}] to {}% (auto brightness stopped until standby or restart)",
-                                    p.name, pct
-                                );
+                                if pct < 5 {
+                                    let _ = set_pause_state(&state_dir, &PauseState::Active);
+                                    println!(
+                                        "Set internal backlight [{}] to {}% (reduced to < 5%: auto brightness enabled)",
+                                        p.name, pct
+                                    );
+                                } else {
+                                    let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                                    println!(
+                                        "Set internal backlight [{}] to {}% (auto brightness stopped until standby or restart)",
+                                        p.name, pct
+                                    );
+                                }
                             }
                         } else {
                             eprintln!("Error: No matching internal backlight panel found.");
@@ -174,11 +182,19 @@ fn main() {
 
                         if let Some(idx) = target_idx {
                             if ddc_set_vcp(idx, pct, std::time::Duration::from_secs(5)) {
-                                let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
-                                println!(
-                                    "Set DDC display {} to {}% (auto brightness stopped until standby or restart)",
-                                    idx, pct
-                                );
+                                if pct < 5 {
+                                    let _ = set_pause_state(&state_dir, &PauseState::Active);
+                                    println!(
+                                        "Set DDC display {} to {}% (reduced to < 5%: auto brightness enabled)",
+                                        idx, pct
+                                    );
+                                } else {
+                                    let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                                    println!(
+                                        "Set DDC display {} to {}% (auto brightness stopped until standby or restart)",
+                                        idx, pct
+                                    );
+                                }
                             } else {
                                 eprintln!("Failed to set DDC brightness on display {}.", idx);
                                 exit(1);
