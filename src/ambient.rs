@@ -13,6 +13,7 @@ pub fn get_iio_root() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct AmbientSensor {
     pub path: PathBuf,
+    pub scale_path: Option<PathBuf>,
 }
 
 impl AmbientSensor {
@@ -22,10 +23,25 @@ impl AmbientSensor {
         if let Ok(entries) = fs::read_dir(&base) {
             for entry in entries.flatten() {
                 let dev_path = entry.path();
-                for filename in &["in_illuminance_input", "in_illuminance_raw", "in_illuminance0_input", "in_illuminance0_raw"] {
+                for filename in &[
+                    "in_illuminance_input",
+                    "in_illuminance_raw",
+                    "in_illuminance0_input",
+                    "in_illuminance0_raw",
+                ] {
                     let p = dev_path.join(filename);
                     if p.exists() {
-                        return Some(Self { path: p });
+                        let scale_candidate = if filename.contains("0") {
+                            dev_path.join("in_illuminance0_scale")
+                        } else {
+                            dev_path.join("in_illuminance_scale")
+                        };
+                        let scale_path = if scale_candidate.exists() {
+                            Some(scale_candidate)
+                        } else {
+                            None
+                        };
+                        return Some(Self { path: p, scale_path });
                     }
                 }
             }
@@ -33,29 +49,47 @@ impl AmbientSensor {
         None
     }
 
-    /// Reads raw illuminance lux value directly from sysfs.
+    /// Reads illuminance lux value from sysfs, applying scale when available.
     pub fn read_lux(&self) -> Option<i64> {
         let content = fs::read_to_string(&self.path).ok()?;
-        content.trim().parse::<i64>().ok()
+        let raw = content.trim().parse::<f64>().ok()?;
+
+        let scaled = if let Some(ref sp) = self.scale_path {
+            if let Ok(scale_str) = fs::read_to_string(sp) {
+                if let Ok(scale) = scale_str.trim().parse::<f64>() {
+                    raw * scale
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+
+        Some(scaled.round() as i64)
     }
 }
 
 /// Calculates brightness offset percentage from lux.
 pub fn calc_ambient_offset(lux: i64) -> i8 {
     if lux < 10 {
-        -15
-    } else if lux < 50 {
         -10
-    } else if lux < 150 {
+    } else if lux < 50 {
         -5
-    } else if lux > 3000 {
-        30
-    } else if lux > 1000 {
-        20
-    } else if lux > 500 {
-        10
-    } else {
+    } else if lux < 150 {
         0
+    } else if lux > 5000 {
+        75
+    } else if lux > 2000 {
+        55
+    } else if lux > 800 {
+        35
+    } else if lux > 300 {
+        15
+    } else {
+        5
     }
 }
 
@@ -124,27 +158,28 @@ mod tests {
 
     #[test]
     fn test_ambient_offset() {
-        assert_eq!(calc_ambient_offset(5), -15);
-        assert_eq!(calc_ambient_offset(30), -10);
-        assert_eq!(calc_ambient_offset(100), -5);
-        assert_eq!(calc_ambient_offset(300), 0);
-        assert_eq!(calc_ambient_offset(600), 10);
-        assert_eq!(calc_ambient_offset(1500), 20);
-        assert_eq!(calc_ambient_offset(5000), 30);
+        assert_eq!(calc_ambient_offset(5), -10);
+        assert_eq!(calc_ambient_offset(30), -5);
+        assert_eq!(calc_ambient_offset(100), 0);
+        assert_eq!(calc_ambient_offset(200), 5);
+        assert_eq!(calc_ambient_offset(500), 15);
+        assert_eq!(calc_ambient_offset(1500), 35);
+        assert_eq!(calc_ambient_offset(3000), 55);
+        assert_eq!(calc_ambient_offset(9000), 75);
     }
 
     #[test]
     fn test_tracker_hysteresis() {
         let mut tracker = AmbientTracker::new(3);
 
-        // Step into bright light (lux 600 -> offset +10)
-        let (offset, changed) = tracker.evaluate_offset(600, 3);
-        assert_eq!(offset, 10);
+        // Step into bright light (lux 500 -> offset +15)
+        let (offset, changed) = tracker.evaluate_offset(500, 3);
+        assert_eq!(offset, 15);
         assert!(changed);
 
-        // Minor change (lux 700 -> offset still +10, diff 0 < 3)
-        let (offset, changed) = tracker.evaluate_offset(700, 3);
-        assert_eq!(offset, 10);
+        // Minor change (lux 520 -> offset still +15, diff 0 < 3)
+        let (offset, changed) = tracker.evaluate_offset(520, 3);
+        assert_eq!(offset, 15);
         assert!(!changed);
     }
 }
