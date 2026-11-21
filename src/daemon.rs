@@ -178,6 +178,9 @@ pub fn run_daemon(foreground: bool) {
     let mut last_applied_raw = panel.as_ref().and_then(|p| p.get_raw().ok()).unwrap_or(0);
     let mut was_paused = read_pause_state(&state_dir).is_paused();
 
+    let daemon_start_time = Instant::now();
+    let mut last_resume_time: Option<Instant> = None;
+
     let mut last_profile_calc = Instant::now() - Duration::from_secs(3600); // Trigger immediately
     let mut last_ambient_check = Instant::now();
     let mut last_config_check = Instant::now();
@@ -203,11 +206,16 @@ pub fn run_daemon(foreground: bool) {
             if clear_manual_override(&state_dir) {
                 eprintln!("[lbright] Resumed from standby: cleared manual override, resuming auto brightness.");
             }
+            last_resume_time = Some(Instant::now());
             last_profile_calc = Instant::now() - Duration::from_secs(3600);
             let _ = ddc_worker.tx.send(DdcCommand::Rescan);
         }
         last_tick_instant = Instant::now();
         last_tick_system_time = SystemTime::now();
+
+        // Check if we are within the startup (10s) or resume (5s) grace period
+        let in_grace_period = daemon_start_time.elapsed() < Duration::from_secs(10)
+            || last_resume_time.map_or(false, |t| t.elapsed() < Duration::from_secs(5));
 
         // 1. Check pause state
         let mut pause_state = read_pause_state(&state_dir);
@@ -253,23 +261,32 @@ pub fn run_daemon(foreground: bool) {
                 } else if !is_paused {
                     // Hardware brightness >= 5% and active: check if hardware brightness was overridden manually
                     if is_manual_override_detected(hw_raw, hw_pct, last_applied_raw, p.max_raw) {
-                        let last_applied_pct = if p.max_raw > 0 {
-                            ((last_applied_raw * 100 + p.max_raw / 2) / p.max_raw).clamp(0, 100) as u8
+                        if in_grace_period {
+                            // During startup/resume grace period, ignore desktop session brightness restore
+                            // and keep tracking hardware to fade smoothly to profile target
+                            last_applied_raw = hw_raw;
+                            if let Some(f) = fader.as_mut() {
+                                f.current_raw = hw_raw;
+                            }
                         } else {
-                            0
-                        };
-                        eprintln!(
-                            "[lbright] Manual brightness adjustment detected: hardware is at {}% (was {}%). Stopping auto brightness until standby or restart.",
-                            hw_pct, last_applied_pct
-                        );
-                        let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
-                        pause_state = PauseState::PausedManualOverride;
-                        is_paused = true;
-                        was_paused = true;
-                        last_applied_raw = hw_raw;
-                        if let Some(f) = fader.as_mut() {
-                            f.current_raw = hw_raw;
-                            f.target_raw = hw_raw;
+                            let last_applied_pct = if p.max_raw > 0 {
+                                ((last_applied_raw * 100 + p.max_raw / 2) / p.max_raw).clamp(0, 100) as u8
+                            } else {
+                                0
+                            };
+                            eprintln!(
+                                "[lbright] Manual brightness adjustment detected: hardware is at {}% (was {}%). Stopping auto brightness until standby or restart.",
+                                hw_pct, last_applied_pct
+                            );
+                            let _ = set_pause_state(&state_dir, &PauseState::PausedManualOverride);
+                            pause_state = PauseState::PausedManualOverride;
+                            is_paused = true;
+                            was_paused = true;
+                            last_applied_raw = hw_raw;
+                            if let Some(f) = fader.as_mut() {
+                                f.current_raw = hw_raw;
+                                f.target_raw = hw_raw;
+                            }
                         }
                     }
                 } else {
