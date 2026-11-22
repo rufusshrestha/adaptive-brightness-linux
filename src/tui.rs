@@ -1,7 +1,8 @@
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::time::Duration;
 
-use crate::ambient::AmbientSensor;
+use crate::ambient::{readings_disagree, AmbientSensor, ProxyLightMonitor};
 use crate::backlight::InternalPanel;
 use crate::config::{
     get_config_path, get_legacy_config_path, load_config, migrate_legacy_config, save_config,
@@ -111,12 +112,34 @@ pub fn show_status(config: &Config, state_dir: &Path) {
     }
 
     println!("\n--- Ambient Light Sensor (ALS) ---");
-    if let Some(als) = AmbientSensor::detect() {
-        let lux = als.read_lux().map(|v| format!("{} lux", v)).unwrap_or_else(|| "Unavailable".to_string());
-        println!("Sensor Path: {}", als.path.display());
-        println!("Current Reading: {} (Ambient config: {})", lux, if config.general.ambient { "Enabled" } else { "Disabled" });
+    let proxy_lux = ProxyLightMonitor::spawn().and_then(|m| m.wait_for_reading(Duration::from_millis(1500)));
+    let sysfs = AmbientSensor::detect();
+    let sysfs_lux = sysfs.as_ref().and_then(|s| s.read_lux());
+    let fmt = |v: Option<f64>| v.map(|v| format!("{:.2} lux", v)).unwrap_or_else(|| "Unavailable".to_string());
+    if proxy_lux.is_some() || sysfs.is_some() {
+        let (current, source) = match (proxy_lux, sysfs_lux) {
+            (Some(v), _) => (Some(v), "iio-sensor-proxy"),
+            (None, Some(v)) => (Some(v), "sysfs"),
+            (None, None) => (None, "none"),
+        };
+        println!(
+            "Current Reading: {} via {} (Ambient config: {})",
+            fmt(current),
+            source,
+            if config.general.ambient { "Enabled" } else { "Disabled" }
+        );
+        println!("  iio-sensor-proxy: {}", fmt(proxy_lux));
+        match &sysfs {
+            Some(s) => println!("  sysfs: {} ({})", fmt(sysfs_lux), s.path.display()),
+            None => println!("  sysfs: no IIO ambient light sensor detected"),
+        }
+        if let (Some(p), Some(s)) = (proxy_lux, sysfs_lux) {
+            if readings_disagree(p, s) {
+                println!("  ⚠ Readings disagree: the sysfs sensor value may be stuck. Try: lbright als-reset");
+            }
+        }
     } else {
-        println!("No IIO ambient light sensors detected.");
+        println!("No ambient light sensors detected (checked iio-sensor-proxy and sysfs IIO).");
     }
 
     println!("\n--- External Displays (DDC/CI) ---");

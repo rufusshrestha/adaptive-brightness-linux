@@ -26,6 +26,7 @@ Built for microsecond-fast direct kernel `sysfs` I/O, robust external monitor DD
 - **🛑 Automatic Pause & Auto-Enable on Manual Override:** Manually adjusting brightness (via laptop Fn keys, desktop sliders, `brightnessctl`, or `lbright set`) to 5% or higher stops auto brightness so it won't fight your preference. It automatically resumes when resuming from standby, restarting, or when manual brightness is reduced to less than 5%.
 - **📈 24-Hour Time Curves:** Smooth, linear interpolation wrapping seamlessly across midnight.
 - **☀️ Ambient Light Sensor (ALS) Integration:** Smooths sensor readings with rolling averages and configurable hysteresis to eliminate screen brightness jitter.
+- **🩹 Self-Healing Sensor Reads:** Prefers `iio-sensor-proxy` (via `monitor-sensor`) when available and falls back to sysfs IIO. Re-detects the sensor if its IIO device path changes, and restarts sensor reads after resume from standby. If the sysfs reading stays frozen (disagreeing with `iio-sensor-proxy` for 3 minutes), the daemon resets the `hid_sensor_als` driver via a small root helper unit, `lbright-als-reset.service`. Both the `.deb` and `install.sh` install this helper and a polkit rule automatically (`install.sh --user-only` skips it). Trigger it manually with `lbright als-reset`.
 - **⌨️ Interactive Terminal UI (TUI):** Built-in ANSI menu (`lbright tui`) to view live status, add/edit/delete curve points, test time targets, toggle ALS, pause/resume, and rescan displays.
 - **🪶 Zero-Overhead Background Daemon:** Uses a predictable 100ms synchronous tick loop with **< 4MB RSS** and 0.0% idle CPU.
 - **🔄 Non-Destructive Migration:** Import legacy `profiles.conf` into the new structured INI format with `lbright migrate [--dry-run]`.
@@ -74,7 +75,8 @@ The installer will:
 1. Compile the optimized release binary (`cargo build --release`).
 2. Install `lbright` to `~/.local/bin/lbright`.
 3. Install and harden `lbright.service` into `~/.config/systemd/user/`.
-4. Gracefully stop any legacy daemon and start `lbright.service`.
+4. Install the ambient light sensor reset helper (asks for `sudo`): `lbright-als-reset.service`, its script in `/usr/local/libexec/lbright/`, and a polkit rule in `/etc/polkit-1/rules.d/`. Use `./install.sh --user-only` to skip this.
+5. Gracefully stop any legacy daemon and start `lbright.service`.
 
 ### Debian / Ubuntu (`.deb` Package)
 
@@ -84,12 +86,17 @@ To build and install a standard Debian package on Debian, Ubuntu, Linux Mint, or
 # Build the package
 ./build-deb.sh
 
-# Install the generated .deb package
-sudo dpkg -i lbright_*.deb
-
-# Enable and start the background service
-systemctl --user enable --now lbright.service
+# Install the generated .deb package (also pulls in recommended iio-sensor-proxy)
+sudo apt install ./lbright_*.deb
 ```
+
+The package enables `lbright.service` for all users and starts it in any session that's already logged in. It also installs the sensor reset helper and polkit rule. To remove everything the package installed and stop running daemons:
+
+```bash
+sudo apt purge lbright
+```
+
+Debian policy doesn't allow packages to delete files in home directories, so remove `~/.config/lbrightness` and `~/.local/state/lbrightness` manually if you want them gone.
 
 ### Manual Build & Installation
 
@@ -148,6 +155,7 @@ lbright <SUBCOMMAND> [OPTIONS]
 | `set <device> <0-100>` | Manually set target brightness percentage on a specific device | `lbright set internal 65` |
 | `pause <duration\|off>` | Temporarily or indefinitely pause automatic adjustments | `lbright pause 30m` |
 | `migrate [--dry-run]` | Import legacy `~/.config/auto-brightness/profiles.conf` into `config.ini` | `lbright migrate --dry-run` |
+| `als-reset` | Reset a stuck ambient light sensor driver (needs the reset helper, installed by default) | `lbright als-reset` |
 | `daemon [--foreground]` | Run background daemon process (used by systemd) | `lbright daemon --foreground` |
 | `version` | Print current `lbright` version | `lbright version` |
 | `help` | Print help and CLI options | `lbright help` |
@@ -389,16 +397,18 @@ systemctl --user enable --now lbright.service
 
 ## 🗑️ Uninstallation
 
-Run the uninstaller script to remove the binary and systemd service:
+For a script install, run the uninstaller. It stops the daemon and any processes it started, then removes the binary, the user service, the sensor reset helper (asks for `sudo`), and your configuration and state (`~/.config/lbrightness/config.ini`, `~/.local/state/lbrightness`). Finally it checks that nothing is left behind. Running `./install.sh` again writes a fresh default `config.ini`.
 
 ```bash
 ./uninstall.sh
 ```
 
-To automatically delete configuration and state files without prompting:
+To keep your configuration and state:
 ```bash
-./uninstall.sh -y
+./uninstall.sh --keep-config
 ```
+
+For a `.deb` install, use `sudo apt purge lbright` (see above).
 
 ---
 

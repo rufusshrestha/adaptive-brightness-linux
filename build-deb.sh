@@ -3,6 +3,8 @@
 # Maintained by LeanBitLab
 
 set -e
+# Package files/dirs must not be group-writable regardless of the builder's umask
+umask 022
 
 echo "=== Building LBrightness Debian Package ==="
 
@@ -39,6 +41,9 @@ DEBIAN_DIR="$STAGE_DIR/DEBIAN"
 BIN_DIR="$STAGE_DIR/usr/bin"
 SYSTEMD_DIR="$STAGE_DIR/usr/lib/systemd/user"
 DOC_DIR="$STAGE_DIR/usr/share/doc/lbright"
+SYSTEMD_SYS_DIR="$STAGE_DIR/usr/lib/systemd/system"
+LIBEXEC_DIR="$STAGE_DIR/usr/libexec/lbright"
+POLKIT_DIR="$STAGE_DIR/usr/share/polkit-1/rules.d"
 
 # Clean previous build artifacts
 rm -rf dist/
@@ -46,6 +51,9 @@ mkdir -p "$DEBIAN_DIR"
 mkdir -p "$BIN_DIR"
 mkdir -p "$SYSTEMD_DIR"
 mkdir -p "$DOC_DIR"
+mkdir -p "$SYSTEMD_SYS_DIR"
+mkdir -p "$LIBEXEC_DIR"
+mkdir -p "$POLKIT_DIR"
 
 echo "Staging files..."
 # Install compiled binary
@@ -54,6 +62,12 @@ install -Dm755 target/release/lbright "$BIN_DIR/lbright"
 # Systemd User Service unit (adjusted for global /usr/bin execution)
 sed 's|%h/.local/bin/lbright|/usr/bin/lbright|g' lbright.service > "$SYSTEMD_DIR/lbright.service"
 chmod 644 "$SYSTEMD_DIR/lbright.service"
+
+# Ambient light sensor auto-heal: root oneshot reset unit + polkit rule letting the
+# active local user start only that unit (used by the daemon and 'lbright als-reset').
+install -Dm755 packaging/als-reset "$LIBEXEC_DIR/als-reset"
+install -Dm644 packaging/lbright-als-reset.service "$SYSTEMD_SYS_DIR/lbright-als-reset.service"
+install -Dm644 packaging/50-lbright.rules "$POLKIT_DIR/50-lbright.rules"
 
 # Copyright / Documentation
 if [ -f "LICENSE" ]; then
@@ -73,7 +87,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: LeanBitLab <leanbitlab@users.noreply.github.com>
 Depends: libc6
-Recommends: ddcutil, i2c-tools
+Recommends: ddcutil, i2c-tools, iio-sensor-proxy, polkitd | policykit-1
 Provides: adaptive-brightness-linux, lbrightness
 Replaces: adaptive-brightness-linux
 Description: Lightweight adaptive screen brightness system for Linux
@@ -88,13 +102,24 @@ cat << 'EOF' > "$DEBIAN_DIR/postinst"
 set -e
 
 if [ "$1" = "configure" ]; then
-    echo "Reloading systemd user daemon..."
-    systemctl --global daemon-reload 2>/dev/null || true
+    echo "Reloading systemd..."
+    systemctl daemon-reload 2>/dev/null || true
+
+    # Enable the user service for every user (starts automatically at login)
+    systemctl --global enable lbright.service 2>/dev/null || true
+
+    # Start (or restart after an upgrade) in sessions that are already logged in
+    for u in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        systemctl --user -M "$u@" daemon-reload 2>/dev/null || true
+        home=$(getent passwd "$u" | cut -d: -f6)
+        if [ -n "$home" ] && [ -e "$home/.config/systemd/user/lbright.service" ]; then
+            echo "Note: $u also has a script-installed lbright (~/.local); run ./uninstall.sh as $u to avoid two installs."
+        fi
+        systemctl --user -M "$u@" restart lbright.service 2>/dev/null || true
+    done
+
     echo ""
-    echo "LBrightness (lbright) installed successfully!"
-    echo "To start the background service for your user:"
-    echo "  systemctl --user enable --now lbright.service"
-    echo ""
+    echo "LBrightness (lbright) installed and started."
     echo "To open the interactive menu: lbright tui"
     echo "To check system status:       lbright status"
 fi
@@ -107,10 +132,35 @@ cat << 'EOF' > "$DEBIAN_DIR/prerm"
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    # Stop running daemons in logged-in sessions (their monitor-sensor child exits with them)
+    for u in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        systemctl --user -M "$u@" stop lbright.service 2>/dev/null || true
+        systemctl --user -M "$u@" reset-failed lbright.service 2>/dev/null || true
+    done
     systemctl --global disable lbright.service 2>/dev/null || true
+    systemctl reset-failed lbright-als-reset.service 2>/dev/null || true
 fi
 EOF
 chmod 755 "$DEBIAN_DIR/prerm"
+
+# Create DEBIAN/postrm (reload systemd so the removed reset unit disappears)
+cat << 'EOF' > "$DEBIAN_DIR/postrm"
+#!/bin/bash
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    systemctl daemon-reload 2>/dev/null || true
+    for u in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        systemctl --user -M "$u@" daemon-reload 2>/dev/null || true
+    done
+fi
+if [ "$1" = "purge" ]; then
+    # Debian policy forbids deleting files in users' home directories from a package.
+    echo "Per-user configuration is kept in ~/.config/lbrightness and ~/.local/state/lbrightness."
+    echo "Delete those directories manually for a complete cleanup."
+fi
+EOF
+chmod 755 "$DEBIAN_DIR/postrm"
 
 # Build the Debian package
 PACKAGE_NAME="lbright_${VERSION}_${ARCH}.deb"

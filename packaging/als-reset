@@ -1,0 +1,33 @@
+#!/bin/sh
+# Resets a stuck HID ambient light sensor (e.g. Intel ISH) by unbinding and
+# rebinding the hid_sensor_als driver. Run as root via lbright-als-reset.service.
+# Takes no arguments: the set of devices touched is fixed to bound ALS sensors.
+set -eu
+
+DRV=/sys/bus/platform/drivers/hid_sensor_als
+
+if [ ! -d "$DRV" ]; then
+    echo "hid_sensor_als driver not loaded; nothing to reset."
+    exit 0
+fi
+
+found=0
+for dev in "$DRV"/HID-SENSOR-200041.*; do
+    [ -e "$dev" ] || continue
+    name=$(basename "$dev")
+    found=1
+    echo "Resetting ambient light sensor $name"
+    echo "$name" > "$DRV/unbind"
+    sleep 1
+    echo "$name" > "$DRV/bind"
+done
+
+if [ "$found" -eq 0 ]; then
+    echo "No bound HID ambient light sensor found; nothing to reset."
+    exit 0
+fi
+
+# Let the IIO device re-enumerate, then make iio-sensor-proxy pick it up again.
+sleep 2
+systemctl try-restart iio-sensor-proxy.service 2>/dev/null || true
+echo "Ambient light sensor reset complete."

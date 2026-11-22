@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ambient::{AmbientSensor, AmbientTracker};
+use crate::ambient::{AmbientSource, AmbientTracker};
 use crate::backlight::InternalPanel;
 use crate::config::{get_config_path, load_config, save_config, Config, DeviceId};
 use crate::ddc::{start_ddc_worker, DdcCommand};
@@ -161,7 +161,7 @@ pub fn run_daemon(foreground: bool) {
 
     let mut last_config_mtime = fs::metadata(&config_path).ok().and_then(|m| m.modified().ok());
     let panel = InternalPanel::detect_primary();
-    let als_sensor = AmbientSensor::detect();
+    let mut ambient_source = AmbientSource::new();
     let mut ambient_tracker = AmbientTracker::new(config.general.ambient_average as usize);
 
     let ddc_worker = start_ddc_worker(
@@ -209,6 +209,7 @@ pub fn run_daemon(foreground: bool) {
             last_resume_time = Some(Instant::now());
             last_profile_calc = Instant::now() - Duration::from_secs(3600);
             let _ = ddc_worker.tx.send(DdcCommand::Rescan);
+            ambient_source.reset();
         }
         last_tick_instant = Instant::now();
         last_tick_system_time = SystemTime::now();
@@ -351,13 +352,11 @@ pub fn run_daemon(foreground: bool) {
         // 5. Ambient light sensor check (every ambient_poll_sec)
         if config.general.ambient && !is_paused && last_ambient_check.elapsed() >= Duration::from_secs(config.general.ambient_poll_sec as u64) {
             last_ambient_check = Instant::now();
-            if let Some(sensor) = &als_sensor {
-                if let Some(lux) = sensor.read_lux() {
-                    let (_offset, changed) = ambient_tracker.evaluate_offset(lux, config.general.ambient_hysteresis_pct);
-                    if changed {
-                        // Ambient condition changed significantly, update targets
-                        last_profile_calc = Instant::now() - Duration::from_secs(3600);
-                    }
+            if let Some((lux, _source)) = ambient_source.read_lux() {
+                let (_offset, changed) = ambient_tracker.evaluate_offset(lux, config.general.ambient_hysteresis_pct);
+                if changed {
+                    // Ambient condition changed significantly, update targets
+                    last_profile_calc = Instant::now() - Duration::from_secs(3600);
                 }
             }
         }

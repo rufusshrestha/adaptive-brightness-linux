@@ -37,6 +37,7 @@ SUBCOMMANDS:
     set <device> <0-100>               Manually set device brightness (e.g. 'internal', 'ddc:1')
     pause <duration|off|indefinite>    Pause or resume automatic brightness adjustments
     migrate [--dry-run]                Import legacy profiles.conf into config.ini
+    als-reset                          Reset a stuck ambient light sensor driver (needs lbright-als-reset.service)
     version                            Print version information
     help                               Print this help message
 
@@ -87,6 +88,25 @@ fn main() {
                 eprintln!("Warning: {}", w);
             }
             tui::show_status(&config, &state_dir);
+        }
+        "als-reset" => {
+            println!("Resetting ambient light sensor driver...");
+            match ambient::als_reset_command().output() {
+                Ok(out) if out.status.success() => println!("Done. Check the reading with: lbright status"),
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    eprintln!("Error: {}", err.trim());
+                    if err.contains("not found") || err.contains("authentication") || err.contains("Access denied") {
+                        eprintln!("The reset helper is not installed (or polkit did not authorise it).");
+                        eprintln!("Install the lbright .deb, or run: ./install.sh");
+                    }
+                    exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Error: could not run systemctl: {}", e);
+                    exit(1);
+                }
+            }
         }
         "scan" => {
             println!("=== Scanning Displays ===");
