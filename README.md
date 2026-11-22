@@ -90,7 +90,7 @@ To build and install a standard Debian package on Debian, Ubuntu, Linux Mint, or
 sudo apt install ./lbright_*.deb
 ```
 
-The package enables `lbright.service` for all users and starts it in any session that's already logged in. It also installs the sensor reset helper and polkit rule. To remove everything the package installed and stop running daemons:
+The package enables `lbright.service` for all users and starts it in any session that's already logged in. It also installs the sensor reset helper and polkit rule. It stops and disables the legacy Python `auto-brightness.service` and replaces the old `adaptive-brightness-linux` package. If you have a script install (`install.sh`), the package stops it and asks you to run `./uninstall.sh --keep-config`, which removes the `~/.local` copy and starts the packaged one. To remove everything the package installed and stop running daemons:
 
 ```bash
 sudo apt purge lbright

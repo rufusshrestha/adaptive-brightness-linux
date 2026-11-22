@@ -46,10 +46,12 @@ lbright_children() {
 
 echo "=== Uninstalling LBrightness ==="
 
+DEB_INSTALLED=0
 if dpkg -s lbright >/dev/null 2>&1; then
-    echo "Note: the lbright .deb package is installed. Remove it with:"
+    DEB_INSTALLED=1
+    echo "Note: the lbright .deb package is installed. This removes only the script-installed"
+    echo "(~/.local) copy and then starts the packaged lbright. To remove the package too:"
     echo "  sudo apt purge lbright"
-    echo "Continuing to remove any script-installed (~/.local) copy..."
 fi
 
 # 1. Stop the service and any other lbright processes (e.g. 'lbright daemon' run by hand)
@@ -144,4 +146,14 @@ else
     echo "Uninstallation finished, but these remain:"
     printf '  %s\n' "${LEFT[@]}"
     exit 1
+fi
+
+# 7. Hand over to the packaged lbright, which the script install was overriding
+if [ "$DEB_INSTALLED" -eq 1 ]; then
+    systemctl --user daemon-reload 2>/dev/null || true
+    if systemctl --user restart lbright.service 2>/dev/null; then
+        echo "Started the packaged lbright (/usr/bin/lbright)."
+    else
+        echo "Warning: could not start the packaged lbright. Try: systemctl --user restart lbright.service"
+    fi
 fi

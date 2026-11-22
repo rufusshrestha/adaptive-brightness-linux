@@ -90,6 +90,7 @@ Depends: libc6
 Recommends: ddcutil, i2c-tools, iio-sensor-proxy, polkitd | policykit-1
 Provides: adaptive-brightness-linux, lbrightness
 Replaces: adaptive-brightness-linux
+Conflicts: adaptive-brightness-linux
 Description: Lightweight adaptive screen brightness system for Linux
  High-performance Rust daemon for intelligent screen brightness
  control using direct sysfs kernel I/O, DDC/CI external monitor support,
@@ -109,14 +110,39 @@ if [ "$1" = "configure" ]; then
     systemctl --global enable lbright.service 2>/dev/null || true
 
     # Start (or restart after an upgrade) in sessions that are already logged in
+    CONFLICT_USERS=""
     for u in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
         systemctl --user -M "$u@" daemon-reload 2>/dev/null || true
+
+        # Legacy Python daemon would fight over brightness: stop and disable it
+        if systemctl --user -M "$u@" cat auto-brightness.service >/dev/null 2>&1; then
+            echo "Stopping and disabling legacy auto-brightness.service for $u..."
+            systemctl --user -M "$u@" disable --now auto-brightness.service 2>/dev/null || true
+        fi
+
+        # A script install (~/.config/systemd/user/lbright.service) overrides the packaged
+        # unit and would run the old ~/.local/bin/lbright. Packages may not delete files in
+        # home directories, so stop it and tell the user how to finish switching over.
         home=$(getent passwd "$u" | cut -d: -f6)
         if [ -n "$home" ] && [ -e "$home/.config/systemd/user/lbright.service" ]; then
-            echo "Note: $u also has a script-installed lbright (~/.local); run ./uninstall.sh as $u to avoid two installs."
+            systemctl --user -M "$u@" stop lbright.service 2>/dev/null || true
+            CONFLICT_USERS="$CONFLICT_USERS $u"
+            continue
         fi
+
         systemctl --user -M "$u@" restart lbright.service 2>/dev/null || true
     done
+
+    if [ -n "$CONFLICT_USERS" ]; then
+        echo ""
+        echo "############################################################################"
+        echo "#  WARNING: script-installed lbright found for:$CONFLICT_USERS"
+        echo "#  It overrides this package, so its daemon has been STOPPED."
+        echo "#  As each of those users, from the lbright source directory, run:"
+        echo "#      ./uninstall.sh --keep-config"
+        echo "#  That removes the ~/.local copy and starts the packaged lbright."
+        echo "############################################################################"
+    fi
 
     echo ""
     echo "LBrightness (lbright) installed and started."
